@@ -17,7 +17,7 @@ import (
 	"sort"
 	"strings"
 
-	"github.com/BurntSushi/toml"
+	"github.com/GuanceCloud/toml"
 )
 
 type testType uint8

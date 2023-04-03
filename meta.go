@@ -1,6 +1,7 @@
 package toml
 
 import (
+	"strconv"
 	"strings"
 )
 
@@ -12,11 +13,12 @@ import (
 type MetaData struct {
 	context Key // Used only during decoding.
 
-	keyInfo map[string]keyInfo
-	mapping map[string]interface{}
-	keys    []Key
-	decoded map[string]struct{}
-	data    []byte // Input file; for errors.
+	keyInfo  map[string]keyInfo
+	mapping  map[string]interface{}
+	keys     []Key
+	comments KeyDict
+	decoded  map[string]struct{}
+	data     []byte // Input file; for errors.
 }
 
 // IsDefined reports if the key exists in the TOML data.
@@ -118,4 +120,264 @@ func (k Key) add(piece string) Key {
 	copy(newKey, k)
 	newKey[len(k)] = piece
 	return newKey
+}
+
+type EntryType int
+type keyPhase int
+type segmentType int
+
+const (
+	EntryComment EntryType = iota + 1
+	EntryKeySegments
+)
+
+const (
+	atHead keyPhase = iota + 1
+	atTail
+)
+
+const (
+	typeString segmentType = iota + 1
+	typeInt
+)
+
+type segment struct {
+	typ   segmentType
+	field string
+	idx   int
+}
+
+func newSegment(x interface{}) segment {
+	switch x := x.(type) {
+	case string:
+		return newField(x)
+	case int:
+		return newIndex(x)
+	}
+	panic("only support string or int type")
+}
+
+func newField(field string) segment {
+	return segment{
+		typ:   typeString,
+		field: field,
+		idx:   0,
+	}
+}
+
+func newIndex(idx int) segment {
+	return segment{
+		typ:   typeInt,
+		field: "",
+		idx:   idx,
+	}
+}
+
+type Entry interface {
+	entryType() EntryType
+}
+
+type KeyDict map[segment]*KeySegments
+
+func (k KeyDict) find(ks *KeySegments) *KeySegments {
+	var (
+		target *KeySegments
+		ok     bool
+	)
+	childDict := k
+	for _, piece := range ks.segments {
+		seg := newSegment(piece)
+		target, ok = childDict[seg]
+		if !ok {
+			return nil
+		}
+		childDict = target.children
+	}
+	return target
+}
+
+type KeySegments struct {
+	segments        []interface{}
+	phase           keyPhase
+	documentComment *Comment
+	lineTailComment *Comment
+	children        KeyDict
+}
+
+func newKeySegments() *KeySegments {
+	return &KeySegments{
+		phase: atHead,
+	}
+}
+
+func findParentKey(arr []*KeySegments, ks *KeySegments) *KeySegments {
+	if len(ks.segments) <= 1 {
+		return nil
+	}
+
+	ks = ks.copy()
+	ks.segments = ks.segments[:len(ks.segments)-1]
+
+	for _, v := range arr {
+		if ks.sameAs(v) {
+			return v
+		}
+	}
+	return nil
+}
+
+func (k *KeySegments) toKey() Key {
+	newKey := make(Key, len(k.segments)/2)
+	for _, seg := range k.segments {
+		if s, ok := seg.(string); ok {
+			newKey = append(newKey, s)
+		}
+	}
+	return newKey
+}
+
+func (k *KeySegments) entryType() EntryType {
+	return EntryKeySegments
+}
+
+func (k *KeySegments) String() string {
+	var sb strings.Builder
+	for i, key := range k.segments {
+		switch key := key.(type) {
+		case string:
+			if i > 0 {
+				sb.WriteString(".")
+			}
+			sb.WriteString(key)
+		case int:
+			sb.WriteString("[" + strconv.Itoa(key) + "]")
+		}
+	}
+	return sb.String()
+}
+
+func (k *KeySegments) atHead() bool {
+	return k.phase == atHead
+}
+
+func (k *KeySegments) atTail() bool {
+	return k.phase == atTail
+}
+
+func (k *KeySegments) sameAs(other *KeySegments) bool {
+	if len(k.segments) != len(other.segments) {
+		return false
+	}
+	for i, s := range k.segments {
+		if s != other.segments[i] {
+			return false
+		}
+	}
+	return true
+}
+
+func (k *KeySegments) copy() *KeySegments {
+	cp := *k
+	cp.segments = append([]interface{}(nil), cp.segments...)
+	return &cp
+}
+
+func (k *KeySegments) start() *KeySegments {
+	cp := k.copy()
+	cp.phase = atHead
+	return cp
+}
+
+func (k *KeySegments) finish() *KeySegments {
+	cp := k.copy()
+	cp.phase = atTail
+	return cp
+}
+
+func (k *KeySegments) appendIndex(idx ...int) *KeySegments {
+	for _, i := range idx {
+		k.segments = append(k.segments, i)
+	}
+	return k
+}
+
+func (k *KeySegments) appendFields(keys ...string) *KeySegments {
+	for _, key := range keys {
+		k.segments = append(k.segments, key)
+	}
+	return k
+}
+
+func (k *KeySegments) popIndex() int {
+	if len(k.segments) == 0 {
+		panic("empty segments")
+	}
+	v := k.segments[len(k.segments)-1]
+	if _, ok := v.(int); !ok {
+		panic("current segment is not an index")
+	}
+	k.segments = k.segments[:len(k.segments)-1]
+	return v.(int)
+}
+
+func (k *KeySegments) popField() string {
+	if len(k.segments) == 0 {
+		panic("empty segments")
+	}
+	v := k.segments[len(k.segments)-1]
+	if _, ok := v.(string); !ok {
+		panic("current segment is not a field")
+	}
+	k.segments = k.segments[:len(k.segments)-1]
+	return v.(string)
+}
+
+type Comment struct {
+	lines      []string
+	IsDocument bool
+}
+
+func newComment(text string, isDoc bool) *Comment {
+	return &Comment{
+		lines:      []string{text},
+		IsDocument: isDoc,
+	}
+}
+
+func (c *Comment) entryType() EntryType {
+	return EntryComment
+}
+
+func (c *Comment) merge(o *Comment) {
+	if c.IsDocument != o.IsDocument {
+		panic("only same type comment can be merged")
+	}
+
+	for i, line := range o.lines {
+		if !strings.HasPrefix(strings.TrimLeftFunc(line, isWhitespace), "#") {
+			o.lines[i] = "#" + line
+		}
+	}
+	c.lines = append(c.lines, o.lines...)
+}
+
+func (c *Comment) String() string {
+	return strings.Join(c.lines, "\n")
+}
+
+type keyStack struct {
+	buckets []*KeySegments
+}
+
+func (k *keyStack) push(ks *KeySegments) {
+	k.buckets = append(k.buckets, ks)
+}
+
+func (k *keyStack) pop() *KeySegments {
+	if len(k.buckets) == 0 {
+		panic("empty stack")
+	}
+	v := k.buckets[len(k.buckets)-1]
+	k.buckets = k.buckets[:len(k.buckets)-1]
+	return v
 }

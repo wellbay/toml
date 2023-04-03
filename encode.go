@@ -14,7 +14,7 @@ import (
 	"strings"
 	"time"
 
-	"github.com/BurntSushi/toml/internal"
+	"github.com/GuanceCloud/toml/internal"
 )
 
 type tomlEncodeError struct{ error }
@@ -118,8 +118,10 @@ type Encoder struct {
 	// String to use for a single indentation level; default is two spaces.
 	Indent string
 
-	w          *bufio.Writer
-	hasWritten bool // written any output to w yet?
+	w               *bufio.Writer
+	hasWritten      bool // written any output to w yet?
+	comments        KeyDict
+	reserveComments bool
 }
 
 // NewEncoder create a new Encoder.
@@ -142,6 +144,14 @@ func (enc *Encoder) Encode(v interface{}) error {
 	return enc.w.Flush()
 }
 
+func (enc *Encoder) EncodeWithComments(v interface{}, meta MetaData) error {
+	if len(meta.comments) > 0 {
+		enc.comments = meta.comments
+		enc.reserveComments = true
+	}
+	return enc.Encode(v)
+}
+
 func (enc *Encoder) safeEncode(key Key, rv reflect.Value) (err error) {
 	defer func() {
 		if r := recover(); r != nil {
@@ -152,20 +162,20 @@ func (enc *Encoder) safeEncode(key Key, rv reflect.Value) (err error) {
 			panic(r)
 		}
 	}()
-	enc.encode(key, rv)
+	enc.encode(key, newKeySegments(), rv)
 	return nil
 }
 
-func (enc *Encoder) encode(key Key, rv reflect.Value) {
+func (enc *Encoder) encode(key Key, keyContext *KeySegments, rv reflect.Value) {
 	// If we can marshal the type to text, then we use that. This prevents the
 	// encoder for handling these types as generic structs (or whatever the
 	// underlying type of a TextMarshaler is).
 	switch {
 	case isMarshaler(rv):
-		enc.writeKeyValue(key, rv, false)
+		enc.writeKeyValue(key, keyContext, rv, false)
 		return
 	case rv.Type() == primitiveType: // TODO: #76 would make this superfluous after implemented.
-		enc.encode(key, reflect.ValueOf(rv.Interface().(Primitive).undecoded))
+		enc.encode(key, keyContext, reflect.ValueOf(rv.Interface().(Primitive).undecoded))
 		return
 	}
 
@@ -176,37 +186,37 @@ func (enc *Encoder) encode(key Key, rv reflect.Value) {
 		reflect.Uint, reflect.Uint8, reflect.Uint16, reflect.Uint32,
 		reflect.Uint64,
 		reflect.Float32, reflect.Float64, reflect.String, reflect.Bool:
-		enc.writeKeyValue(key, rv, false)
+		enc.writeKeyValue(key, keyContext, rv, false)
 	case reflect.Array, reflect.Slice:
 		if typeEqual(tomlArrayHash, tomlTypeOfGo(rv)) {
-			enc.eArrayOfTables(key, rv)
+			enc.eArrayOfTables(key, keyContext, rv)
 		} else {
-			enc.writeKeyValue(key, rv, false)
+			enc.writeKeyValue(key, keyContext, rv, false)
 		}
 	case reflect.Interface:
 		if rv.IsNil() {
 			return
 		}
-		enc.encode(key, rv.Elem())
+		enc.encode(key, keyContext, rv.Elem())
 	case reflect.Map:
 		if rv.IsNil() {
 			return
 		}
-		enc.eTable(key, rv)
+		enc.eTable(key, keyContext, rv)
 	case reflect.Ptr:
 		if rv.IsNil() {
 			return
 		}
-		enc.encode(key, rv.Elem())
+		enc.encode(key, keyContext, rv.Elem())
 	case reflect.Struct:
-		enc.eTable(key, rv)
+		enc.eTable(key, keyContext, rv)
 	default:
 		encPanic(fmt.Errorf("unsupported type for key '%s': %s", key, k))
 	}
 }
 
 // eElement encodes any value that can be an array element.
-func (enc *Encoder) eElement(rv reflect.Value) {
+func (enc *Encoder) eElement(rv reflect.Value, keyContext *KeySegments) {
 	switch v := rv.Interface().(type) {
 	case time.Time: // Using TextMarshaler adds extra quotes, which we don't want.
 		format := time.RFC3339Nano
@@ -255,10 +265,10 @@ func (enc *Encoder) eElement(rv reflect.Value) {
 			enc.w.WriteByte('0')
 			return
 		} else if v, err := n.Int64(); err == nil {
-			enc.eElement(reflect.ValueOf(v))
+			enc.eElement(reflect.ValueOf(v), keyContext)
 			return
 		} else if v, err := n.Float64(); err == nil {
-			enc.eElement(reflect.ValueOf(v))
+			enc.eElement(reflect.ValueOf(v), keyContext)
 			return
 		}
 		encPanic(fmt.Errorf("unable to convert %q to int64 or float64", n))
@@ -266,7 +276,7 @@ func (enc *Encoder) eElement(rv reflect.Value) {
 
 	switch rv.Kind() {
 	case reflect.Ptr:
-		enc.eElement(rv.Elem())
+		enc.eElement(rv.Elem(), keyContext)
 		return
 	case reflect.String:
 		enc.writeQuoted(rv.String())
@@ -295,13 +305,13 @@ func (enc *Encoder) eElement(rv reflect.Value) {
 			enc.wf(floatAddDecimal(strconv.FormatFloat(f, 'f', -1, 64)))
 		}
 	case reflect.Array, reflect.Slice:
-		enc.eArrayOrSliceElement(rv)
+		enc.eArrayOrSliceElement(rv, keyContext)
 	case reflect.Struct:
-		enc.eStruct(nil, rv, true)
+		enc.eStruct(nil, keyContext, rv, true)
 	case reflect.Map:
-		enc.eMap(nil, rv, true)
+		enc.eMap(nil, keyContext, rv, true)
 	case reflect.Interface:
-		enc.eElement(rv.Elem())
+		enc.eElement(rv.Elem(), keyContext)
 	default:
 		encPanic(fmt.Errorf("unexpected type: %T", rv.Interface()))
 	}
@@ -320,20 +330,33 @@ func (enc *Encoder) writeQuoted(s string) {
 	enc.wf("\"%s\"", dblQuotedReplacer.Replace(s))
 }
 
-func (enc *Encoder) eArrayOrSliceElement(rv reflect.Value) {
+func (enc *Encoder) eArrayOrSliceElement(rv reflect.Value, keyContext *KeySegments) {
 	length := rv.Len()
 	enc.wf("[")
 	for i := 0; i < length; i++ {
 		elem := eindirect(rv.Index(i))
-		enc.eElement(elem)
+		var ctx *KeySegments
+		if enc.reserveComments {
+			ctx = enc.comments.find(keyContext.copy().appendIndex(i))
+		}
+		if ctx != nil && ctx.documentComment != nil {
+			enc.wf("\n")
+			for _, line := range ctx.documentComment.lines {
+				enc.wf("%s%s\n", enc.indentStr(ctx.toKey()), line)
+			}
+		}
+		enc.eElement(elem, keyContext.copy().appendIndex(i))
 		if i != length-1 {
 			enc.wf(", ")
+		}
+		if ctx != nil && ctx.lineTailComment != nil {
+			enc.wf(" %s\n", strings.Join(ctx.lineTailComment.lines, " "))
 		}
 	}
 	enc.wf("]")
 }
 
-func (enc *Encoder) eArrayOfTables(key Key, rv reflect.Value) {
+func (enc *Encoder) eArrayOfTables(key Key, keyContext *KeySegments, rv reflect.Value) {
 	if len(key) == 0 {
 		encPanic(errNoKey)
 	}
@@ -343,38 +366,63 @@ func (enc *Encoder) eArrayOfTables(key Key, rv reflect.Value) {
 			continue
 		}
 		enc.newline()
+		var ctx *KeySegments
+		if enc.reserveComments {
+			ctx = enc.comments.find(keyContext.copy().appendIndex(i))
+		}
+		if ctx != nil && ctx.documentComment != nil {
+			for _, line := range ctx.documentComment.lines {
+				enc.wf("%s%s\n", enc.indentStr(key), line)
+			}
+		}
 		enc.wf("%s[[%s]]", enc.indentStr(key), key)
+		if ctx != nil && ctx.lineTailComment != nil {
+			enc.wf(" %s", strings.Join(ctx.lineTailComment.lines, " "))
+		}
 		enc.newline()
-		enc.eMapOrStruct(key, trv, false)
+		enc.eMapOrStruct(key, keyContext.copy().appendIndex(i), trv, false)
 	}
 }
 
-func (enc *Encoder) eTable(key Key, rv reflect.Value) {
+func (enc *Encoder) eTable(key Key, keyContext *KeySegments, rv reflect.Value) {
 	if len(key) == 1 {
 		// Output an extra newline between top-level tables.
 		// (The newline isn't written if nothing else has been written though.)
 		enc.newline()
 	}
 	if len(key) > 0 {
+		var ctx *KeySegments
+		if enc.reserveComments {
+			ctx = enc.comments.find(keyContext)
+		}
+		if ctx != nil && ctx.documentComment != nil {
+			enc.newline()
+			for _, line := range ctx.documentComment.lines {
+				enc.wf("%s%s\n", enc.indentStr(key), line)
+			}
+		}
 		enc.wf("%s[%s]", enc.indentStr(key), key)
+		if ctx != nil && ctx.lineTailComment != nil {
+			enc.wf(" %s", strings.Join(ctx.lineTailComment.lines, " "))
+		}
 		enc.newline()
 	}
-	enc.eMapOrStruct(key, rv, false)
+	enc.eMapOrStruct(key, keyContext, rv, false)
 }
 
-func (enc *Encoder) eMapOrStruct(key Key, rv reflect.Value, inline bool) {
+func (enc *Encoder) eMapOrStruct(key Key, keyContext *KeySegments, rv reflect.Value, inline bool) {
 	switch rv.Kind() {
 	case reflect.Map:
-		enc.eMap(key, rv, inline)
+		enc.eMap(key, keyContext, rv, inline)
 	case reflect.Struct:
-		enc.eStruct(key, rv, inline)
+		enc.eStruct(key, keyContext, rv, inline)
 	default:
 		// Should never happen?
 		panic("eTable: unhandled reflect.Value Kind: " + rv.Kind().String())
 	}
 }
 
-func (enc *Encoder) eMap(key Key, rv reflect.Value, inline bool) {
+func (enc *Encoder) eMap(key Key, keyContext *KeySegments, rv reflect.Value, inline bool) {
 	rt := rv.Type()
 	if rt.Key().Kind() != reflect.String {
 		encPanic(errNonString)
@@ -401,12 +449,12 @@ func (enc *Encoder) eMap(key Key, rv reflect.Value, inline bool) {
 			}
 
 			if inline {
-				enc.writeKeyValue(Key{mapKey}, val, true)
+				enc.writeKeyValue(Key{mapKey}, keyContext.copy().appendFields(mapKey), val, true)
 				if trailC || i != len(mapKeys)-1 {
 					enc.wf(", ")
 				}
 			} else {
-				enc.encode(key.add(mapKey), val)
+				enc.encode(key.add(mapKey), keyContext.copy().appendFields(mapKey), val)
 			}
 		}
 	}
@@ -430,7 +478,7 @@ func pointerTo(t reflect.Type) reflect.Type {
 	return t
 }
 
-func (enc *Encoder) eStruct(key Key, rv reflect.Value, inline bool) {
+func (enc *Encoder) eStruct(key Key, keyContext *KeySegments, rv reflect.Value, inline bool) {
 	// Write keys for fields directly under this key first, because if we write
 	// a field that creates a new table then all keys under it will be in that
 	// table (not the one we're writing here).
@@ -513,12 +561,12 @@ func (enc *Encoder) eStruct(key Key, rv reflect.Value, inline bool) {
 			}
 
 			if inline {
-				enc.writeKeyValue(Key{keyName}, fieldVal, true)
+				enc.writeKeyValue(Key{keyName}, keyContext, fieldVal, true)
 				if fieldIndex[0] != len(fields)-1 {
 					enc.wf(", ")
 				}
 			} else {
-				enc.encode(key.add(keyName), fieldVal)
+				enc.encode(key.add(keyName), keyContext.copy().appendFields(keyName), fieldVal)
 			}
 		}
 	}
@@ -692,12 +740,25 @@ func (enc *Encoder) newline() {
 //	│      ┌───┐  ┌────┐│
 //	v      v   v  v    vv
 //	key = {k = 1, k2 = 2}
-func (enc *Encoder) writeKeyValue(key Key, val reflect.Value, inline bool) {
+func (enc *Encoder) writeKeyValue(key Key, keyContext *KeySegments, val reflect.Value, inline bool) {
 	if len(key) == 0 {
 		encPanic(errNoKey)
 	}
+	var ctx *KeySegments
+	if enc.reserveComments {
+		ctx = enc.comments.find(keyContext)
+	}
+	if ctx != nil && ctx.documentComment != nil {
+		enc.newline()
+		for _, line := range ctx.documentComment.lines {
+			enc.wf("%s%s\n", enc.indentStr(key), line)
+		}
+	}
 	enc.wf("%s%s = ", enc.indentStr(key), key.maybeQuoted(len(key)-1))
-	enc.eElement(val)
+	enc.eElement(val, keyContext)
+	if ctx != nil && ctx.lineTailComment != nil {
+		enc.wf(" %s\n", strings.Join(ctx.lineTailComment.lines, " "))
+	}
 	if !inline {
 		enc.newline()
 	}

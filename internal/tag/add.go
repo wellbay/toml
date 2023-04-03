@@ -5,7 +5,7 @@ import (
 	"math"
 	"time"
 
-	"github.com/BurntSushi/toml/internal"
+	"github.com/GuanceCloud/toml/internal"
 )
 
 // Add JSON tags to a data structure as expected by toml-test.

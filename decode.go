@@ -158,13 +158,95 @@ func (dec *Decoder) Decode(v interface{}) (MetaData, error) {
 		return MetaData{}, err
 	}
 
+	entryKeys := make([]*KeySegments, 0)
+
+	var prevEntry Entry
+	stack := &keyStack{}
+	for _, entry := range p.entries {
+		switch e := entry.(type) {
+		case *Comment:
+			if e.IsDocument {
+				if comment, ok := prevEntry.(*Comment); ok && comment.IsDocument {
+					// merge multi line document comment into one
+					comment.merge(e)
+				} else {
+					prevEntry = entry
+				}
+			} else {
+				if prevEntry == nil {
+					panic("unable to bind line tail comment to a key")
+				}
+				ks, ok := prevEntry.(*KeySegments)
+				if !ok {
+					panic("previous entry is not a key")
+				}
+				if ks.lineTailComment != nil {
+					ks.lineTailComment.merge(e)
+				} else {
+					ks.lineTailComment = e
+				}
+			}
+		case *KeySegments:
+			if e.atHead() {
+				stack.push(e)
+				entryKeys = append(entryKeys, e)
+			} else {
+				for {
+					ks := stack.pop()
+					if ks.sameAs(e) {
+						e = ks
+						break
+					}
+				}
+			}
+			if comment, ok := prevEntry.(*Comment); ok {
+				if !comment.IsDocument {
+					panic("previous entry is a line tail comment")
+				}
+				if e.documentComment != nil {
+					e.documentComment.merge(comment)
+				} else {
+					e.documentComment = comment
+				}
+			}
+			prevEntry = e
+		default:
+			panic(fmt.Sprintf("type not supported: %T", e))
+		}
+	}
+	topEntryKeys := make(KeyDict, 0)
+	idx := 0
+	for idx < len(entryKeys) {
+		entryKey := entryKeys[idx]
+		parent := findParentKey(entryKeys, entryKey)
+		if parent == nil {
+			if len(entryKey.segments) > 1 {
+				parent = newKeySegments()
+				parent.segments = append([]interface{}(nil), entryKey.segments[:len(entryKey.segments)-1]...)
+				parent.children = KeyDict{
+					newSegment(entryKey.segments[len(entryKey.segments)-1]): entryKey,
+				}
+				entryKeys = append(entryKeys, parent)
+			} else {
+				topEntryKeys[newSegment(entryKey.segments[len(entryKey.segments)-1])] = entryKey
+			}
+		} else {
+			if parent.children == nil {
+				parent.children = make(KeyDict, 1)
+			}
+			parent.children[newSegment(entryKey.segments[len(entryKey.segments)-1])] = entryKey
+		}
+		idx++
+	}
+
 	md := MetaData{
-		mapping: p.mapping,
-		keyInfo: p.keyInfo,
-		keys:    p.ordered,
-		decoded: make(map[string]struct{}, len(p.ordered)),
-		context: nil,
-		data:    data,
+		mapping:  p.mapping,
+		keyInfo:  p.keyInfo,
+		keys:     p.ordered,
+		comments: topEntryKeys,
+		decoded:  make(map[string]struct{}, len(p.ordered)),
+		context:  nil,
+		data:     data,
 	}
 	return md, md.unify(p.mapping, rv)
 }

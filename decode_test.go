@@ -14,7 +14,7 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BurntSushi/toml/internal"
+	"github.com/GuanceCloud/toml/internal"
 )
 
 func WithTomlNext(f func()) {

@@ -1,3 +1,3 @@
-module github.com/BurntSushi/toml
+module github.com/GuanceCloud/toml
 
 go 1.16

@@ -46,12 +46,13 @@ func (p Position) String() string {
 }
 
 type lexer struct {
-	input string
-	start int
-	pos   int
-	line  int
-	state stateFn
-	items chan item
+	input       string
+	start       int
+	pos         int
+	preEmitLine int // the line of latest emit
+	line        int
+	state       stateFn
+	items       chan item
 
 	// Allow for backing up up to 4 runes. This is necessary because TOML
 	// contains 3-rune tokens (""" and ''').
@@ -69,10 +70,11 @@ type lexer struct {
 }
 
 type item struct {
-	typ itemType
-	val string
-	err error
-	pos Position
+	typ        itemType
+	val        string
+	err        error
+	pos        Position
+	atLineHead bool
 }
 
 func (lx *lexer) nextItem() item {
@@ -133,13 +135,23 @@ func (lx *lexer) emit(typ itemType) {
 		lx.error(errLexUTF8{lx.input[lx.pos]})
 		return
 	}
-	lx.items <- item{typ: typ, pos: lx.getPos(), val: lx.current()}
+	atLineHead := false
+	if lx.preEmitLine < lx.line {
+		atLineHead = true
+	}
+	lx.items <- item{typ: typ, pos: lx.getPos(), val: lx.current(), atLineHead: atLineHead}
 	lx.start = lx.pos
+	lx.preEmitLine = lx.line
 }
 
 func (lx *lexer) emitTrim(typ itemType) {
-	lx.items <- item{typ: typ, pos: lx.getPos(), val: strings.TrimSpace(lx.current())}
+	atLineHead := false
+	if lx.preEmitLine < lx.line {
+		atLineHead = true
+	}
+	lx.items <- item{typ: typ, pos: lx.getPos(), val: strings.TrimSpace(lx.current()), atLineHead: atLineHead}
 	lx.start = lx.pos
+	lx.preEmitLine = lx.line
 }
 
 func (lx *lexer) next() (r rune) {

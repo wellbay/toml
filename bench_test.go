@@ -13,8 +13,8 @@ import (
 	"testing"
 	"time"
 
-	"github.com/BurntSushi/toml"
-	tomltest "github.com/BurntSushi/toml/internal/toml-test"
+	"github.com/GuanceCloud/toml"
+	tomltest "github.com/GuanceCloud/toml/internal/toml-test"
 )
 
 func BenchmarkDecode(b *testing.B) {

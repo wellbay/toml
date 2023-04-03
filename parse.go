@@ -8,7 +8,7 @@ import (
 	"time"
 	"unicode/utf8"
 
-	"github.com/BurntSushi/toml/internal"
+	"github.com/GuanceCloud/toml/internal"
 )
 
 var tomlNext = func() bool {
@@ -17,12 +17,14 @@ var tomlNext = func() bool {
 }()
 
 type parser struct {
-	lx         *lexer
-	context    Key      // Full key for the current hash in scope.
-	currentKey string   // Base key name for everything except hashes.
-	pos        Position // Current position in the TOML file.
+	lx           *lexer
+	context      Key // Full key for the current hash in scope.
+	entryContext *KeySegments
+	currentKey   string   // Base key name for everything except hashes.
+	pos          Position // Current position in the TOML file.
 
 	ordered []Key // List of keys in the order that they appear in the TOML data.
+	entries []Entry
 
 	keyInfo   map[string]keyInfo     // Map keyname → info about the TOML key.
 	mapping   map[string]interface{} // Map keyname → key value.
@@ -72,11 +74,12 @@ func parse(data string) (p *parser, err error) {
 	}
 
 	p = &parser{
-		keyInfo:   make(map[string]keyInfo),
-		mapping:   make(map[string]interface{}),
-		lx:        lex(data),
-		ordered:   make([]Key, 0),
-		implicits: make(map[string]struct{}),
+		entryContext: newKeySegments(),
+		keyInfo:      make(map[string]keyInfo),
+		mapping:      make(map[string]interface{}),
+		lx:           lex(data),
+		ordered:      make([]Key, 0),
+		implicits:    make(map[string]struct{}),
 	}
 	for {
 		item := p.next()
@@ -150,6 +153,14 @@ func (p *parser) expect(typ itemType) item {
 	return it
 }
 
+func (p *parser) expectComment(typ itemType, isDoc bool) item {
+	it := p.next()
+	p.assertEqual(typ, it.typ)
+	comm := newComment("#"+it.val, isDoc)
+	p.entries = append(p.entries, comm)
+	return it
+}
+
 func (p *parser) assertEqual(expected, got itemType) {
 	if expected != got {
 		p.bug("Expected '%s' but got '%s'.", expected, got)
@@ -159,8 +170,15 @@ func (p *parser) assertEqual(expected, got itemType) {
 func (p *parser) topLevel(item item) {
 	switch item.typ {
 	case itemCommentStart: // # ..
-		p.expect(itemText)
+		p.expectComment(itemText, item.atLineHead)
 	case itemTableStart: // [ .. ]
+		//if len(p.context) > 0 {
+		//	if ki, ok := p.keyInfo[p.context.String()]; ok {
+		//		if ki.tomlType == tomlHash || ki.tomlType == tomlArrayHash {
+		//			p.entries = append(p.entries, p.entryContext.finish())
+		//		}
+		//	}
+		//}
 		name := p.nextPos()
 
 		var key Key
@@ -170,9 +188,19 @@ func (p *parser) topLevel(item item) {
 		p.assertEqual(itemTableEnd, name.typ)
 
 		p.addContext(key, false)
+		p.addEntryContext(key, false)
 		p.setType("", tomlHash, item.pos)
 		p.ordered = append(p.ordered, key)
+		ks := newKeySegments().appendFields(key...)
+		p.entries = append(p.entries, ks.start())
 	case itemArrayTableStart: // [[ .. ]]
+		//if len(p.context) > 0 {
+		//	if ki, ok := p.keyInfo[p.context.String()]; ok {
+		//		if ki.tomlType == tomlHash || ki.tomlType == tomlArrayHash {
+		//			p.entries = append(p.entries, p.entryContext.finish())
+		//		}
+		//	}
+		//}
 		name := p.nextPos()
 
 		var key Key
@@ -182,10 +210,12 @@ func (p *parser) topLevel(item item) {
 		p.assertEqual(itemArrayTableEnd, name.typ)
 
 		p.addContext(key, true)
+		p.addEntryContext(key, true)
 		p.setType("", tomlArrayHash, item.pos)
 		p.ordered = append(p.ordered, key)
 	case itemKeyStart: // key = ..
 		outerContext := p.context
+		outerEntryContext := p.entryContext.copy()
 		/// Read all the key parts (e.g. 'a' and 'b' in 'a.b')
 		k := p.nextPos()
 		var key Key
@@ -197,6 +227,7 @@ func (p *parser) topLevel(item item) {
 		/// The current key is the last part.
 		p.currentKey = key[len(key)-1]
 
+		p.entryContext.appendFields(key...)
 		/// All the other parts (if any) are the context; need to set each part
 		/// as implicit.
 		context := key[:len(key)-1]
@@ -204,15 +235,17 @@ func (p *parser) topLevel(item item) {
 			p.addImplicitContext(append(p.context, context[i:i+1]...))
 		}
 
+		p.entries = append(p.entries, p.entryContext.start())
 		/// Set value.
 		vItem := p.next()
 		val, typ := p.value(vItem, false)
 		p.set(p.currentKey, val, typ, vItem.pos)
 		p.ordered = append(p.ordered, p.context.add(p.currentKey))
-
+		p.entries = append(p.entries, p.entryContext.finish())
 		/// Remove the context we added (preserving any context from [tbl] lines).
 		p.context = outerContext
 		p.currentKey = ""
+		p.entryContext = outerEntryContext
 	default:
 		p.bug("Unexpected type at top level: %s", item.typ)
 	}
@@ -387,15 +420,22 @@ func (p *parser) valueArray(it item) (interface{}, tomlType) {
 		// { S []string }. See #338
 		array = []interface{}{}
 	)
+	idx := 0
+	p.entryContext.appendIndex(idx)
 	for it = p.next(); it.typ != itemArrayEnd; it = p.next() {
 		if it.typ == itemCommentStart {
-			p.expect(itemText)
+			p.expectComment(itemText, it.atLineHead)
 			continue
 		}
 
+		p.entries = append(p.entries, p.entryContext.start())
 		val, typ := p.value(it, true)
+		p.entries = append(p.entries, p.entryContext.finish())
 		array = append(array, val)
 		types = append(types, typ)
+		idx++
+		p.entryContext.popIndex()
+		p.entryContext.appendIndex(idx)
 
 		// XXX: types isn't used here, we need it to record the accurate type
 		// information.
@@ -404,6 +444,7 @@ func (p *parser) valueArray(it item) (interface{}, tomlType) {
 		// "key[1]" notation, or maybe store it on the Array type?
 		_ = types
 	}
+	p.entryContext.popIndex()
 	return array, tomlArray
 }
 
@@ -413,6 +454,7 @@ func (p *parser) valueInlineTable(it item, parentIsArray bool) (interface{}, tom
 		outerContext = p.context
 		outerKey     = p.currentKey
 	)
+	outerEntryContext := p.entryContext.copy()
 
 	p.context = append(p.context, p.currentKey)
 	prevContext := p.context
@@ -424,7 +466,7 @@ func (p *parser) valueInlineTable(it item, parentIsArray bool) (interface{}, tom
 	/// Loop over all table key/value pairs.
 	for it := p.next(); it.typ != itemInlineTableEnd; it = p.next() {
 		if it.typ == itemCommentStart {
-			p.expect(itemText)
+			p.expectComment(itemText, it.atLineHead)
 			continue
 		}
 
@@ -445,18 +487,22 @@ func (p *parser) valueInlineTable(it item, parentIsArray bool) (interface{}, tom
 		for i := range context {
 			p.addImplicitContext(append(p.context, context[i:i+1]...))
 		}
-
+		p.entryContext.appendFields(p.currentKey)
+		p.entries = append(p.entries, p.entryContext.start())
 		/// Set the value.
 		val, typ := p.value(p.next(), false)
 		p.set(p.currentKey, val, typ, it.pos)
 		p.ordered = append(p.ordered, p.context.add(p.currentKey))
+		p.entries = append(p.entries, p.entryContext.finish())
 		hash[p.currentKey] = val
 
 		/// Restore context.
 		p.context = prevContext
+		p.entryContext = outerEntryContext.copy()
 	}
 	p.context = outerContext
 	p.currentKey = outerKey
+	p.entryContext = outerEntryContext
 	return hash, tomlHash
 }
 
@@ -564,6 +610,59 @@ func (p *parser) addContext(key Key, array bool) {
 		p.setValue(key[len(key)-1], make(map[string]interface{}))
 	}
 	p.context = append(p.context, key[len(key)-1])
+}
+
+func (p *parser) addEntryContext(key Key, array bool) {
+	var ok bool
+
+	// Always start at the top level and drill down for our context.
+	hashContext := p.mapping
+	entryContext := newKeySegments()
+
+	// We only need implicit hashes for key[0:-1]
+	for _, k := range key[0 : len(key)-1] {
+		_, ok = hashContext[k]
+		entryContext.appendFields(k)
+
+		// No key? Make an implicit hash and move on.
+		if !ok {
+			hashContext[k] = make(map[string]interface{})
+		}
+
+		// If the hash context is actually an array of tables, then set
+		// the hash context to the last element in that array.
+		//
+		// Otherwise, it better be a table, since this MUST be a key group (by
+		// virtue of it not being the last element in a key).
+		switch t := hashContext[k].(type) {
+		case []map[string]interface{}:
+			hashContext = t[len(t)-1]
+			entryContext.appendIndex(len(t) - 1)
+		case map[string]interface{}:
+			hashContext = t
+		default:
+			p.panicf("Key was already created as a hash.")
+		}
+	}
+	entryContext.appendFields(key[len(key)-1])
+	if array {
+		// If this is the first element for this array, then allocate a new
+		// list of tables for it.
+		k := key[len(key)-1]
+		if _, ok := hashContext[k]; !ok {
+			hashContext[k] = make([]map[string]interface{}, 0, 4)
+		}
+
+		// Add a new table. But make sure the key hasn't already been used
+		// for something else.
+		if hash, ok := hashContext[k].([]map[string]interface{}); ok {
+			entryContext.appendIndex(len(hash) - 1)
+			p.entries = append(p.entries, entryContext.start())
+		} else {
+			p.panicf("Key '%s' was already created and cannot be used as an array.", key)
+		}
+	}
+	p.entryContext = entryContext
 }
 
 // set calls setValue and setType.
