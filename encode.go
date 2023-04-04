@@ -332,28 +332,35 @@ func (enc *Encoder) writeQuoted(s string) {
 
 func (enc *Encoder) eArrayOrSliceElement(rv reflect.Value, keyContext *KeySegments) {
 	length := rv.Len()
-	enc.wf("[")
+	key := keyContext.toKey()
+	enc.wf("[\n")
 	for i := 0; i < length; i++ {
 		elem := eindirect(rv.Index(i))
 		var ctx *KeySegments
 		if enc.reserveComments {
 			ctx = enc.comments.find(keyContext.copy().appendIndex(i))
 		}
-		if ctx != nil && ctx.documentComment != nil {
-			enc.wf("\n")
-			for _, line := range ctx.documentComment.lines {
-				enc.wf("%s%s\n", enc.indentStr(ctx.toKey()), line)
+		if ctx != nil {
+			if ctx.documentComment != nil {
+				enc.newline()
+				for _, line := range ctx.documentComment.lines {
+					enc.wf("%s%s\n", enc.indentStr(key), line)
+				}
 			}
+			enc.wf("%s", enc.indentStr(key.add("")))
 		}
 		enc.eElement(elem, keyContext.copy().appendIndex(i))
 		if i != length-1 {
 			enc.wf(", ")
 		}
-		if ctx != nil && ctx.lineTailComment != nil {
-			enc.wf(" %s\n", strings.Join(ctx.lineTailComment.lines, " "))
+		if ctx != nil {
+			if ctx.lineTailComment != nil {
+				enc.wf(" %s", strings.Join(ctx.lineTailComment.lines, " "))
+			}
+			enc.newline()
 		}
 	}
-	enc.wf("]")
+	enc.wf("%s]", enc.indentStr(key))
 }
 
 func (enc *Encoder) eArrayOfTables(key Key, keyContext *KeySegments, rv reflect.Value) {
@@ -758,8 +765,7 @@ func (enc *Encoder) writeKeyValue(key Key, keyContext *KeySegments, val reflect.
 	enc.eElement(val, keyContext)
 	if ctx != nil && ctx.lineTailComment != nil {
 		enc.wf(" %s\n", strings.Join(ctx.lineTailComment.lines, " "))
-	}
-	if !inline {
+	} else if !inline {
 		enc.newline()
 	}
 }
