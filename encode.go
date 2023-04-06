@@ -332,6 +332,10 @@ func (enc *Encoder) writeQuoted(s string) {
 
 func (enc *Encoder) eArrayOrSliceElement(rv reflect.Value, keyContext *KeySegments) {
 	length := rv.Len()
+	if length == 0 {
+		enc.wf("[]")
+		return
+	}
 	key := keyContext.toKey()
 	enc.wf("[\n")
 	for i := 0; i < length; i++ {
