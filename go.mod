@@ -1,3 +1,3 @@
-module github.com/GuanceCloud/toml
+module github.com/wellbay/toml
 
 go 1.16
